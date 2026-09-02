@@ -1199,6 +1199,12 @@ async function deleteComment(commentId, videoId) {
 }
 
 // ===== Presentation viewer =====
+// mode 'images': the new custom in-platform viewer (slide images + our
+// own buttons/counter/keyboard/fullscreen — no Google UI visible).
+// mode 'iframe': the old Google Slides/file embed, kept as a fallback
+// for any presentation that hasn't been converted to Slides yet.
+let slideViewerState = { images: [], current: 0, mode: 'iframe' };
+
 async function loadPresentationPage() {
   const params = new URLSearchParams(location.search);
   const id = params.get('id');
@@ -1209,7 +1215,38 @@ async function loadPresentationPage() {
     if (!item) { toast('❌ الملف غير موجود'); return; }
     document.getElementById('presentation-title').textContent = item.title || 'عرض تقديمي';
     document.getElementById('back-to-course').href = 'course.html?id=' + item.unitId;
-    const frame = document.getElementById('presentation-frame');
+
+    let slideImages = null;
+    if (item.slidesId) {
+      try {
+        const slidesRes = await api('/presentations/' + id + '/slides');
+        if (slidesRes && slidesRes.ok && slidesRes.data && slidesRes.data.slideImages && slidesRes.data.slideImages.length) {
+          slideImages = slidesRes.data.slideImages;
+        }
+      } catch (e) {
+        // getSlideImages failed (quota, Apps Script hiccup, etc.) — fall
+        // through to the iframe fallback below rather than leaving the
+        // student with a blank page.
+      }
+    }
+
+    if (slideImages) initSlideViewer_(slideImages);
+    else initIframeViewer_(item);
+
+    renderPresentationWatermark();
+    setupPresentationDeterrents();
+  } catch (e) { toast('❌ فشل تحميل العرض التقديمي'); }
+}
+
+function initIframeViewer_(item) {
+  slideViewerState.mode = 'iframe';
+  const frame = document.getElementById('presentation-frame');
+  const img = document.getElementById('slide-image');
+  const controls = document.getElementById('slide-controls');
+  if (img) img.style.display = 'none';
+  if (controls) controls.style.display = 'none';
+  if (frame) {
+    frame.style.display = 'block';
     // Trust the URL saved at upload/link time first — it's already the
     // correct embeddable form (a Slides /embed URL for converted
     // PowerPoint uploads, giving real next/previous slide arrows that
@@ -1218,10 +1255,86 @@ async function loadPresentationPage() {
     // URL from driveFileId if nothing better was stored.
     const previewUrl = item.driveUrl
       || (item.driveFileId ? 'https://drive.google.com/file/d/' + item.driveFileId + '/preview' : '');
-    if (frame) frame.src = previewUrl;
-    renderPresentationWatermark();
-    setupPresentationDeterrents();
-  } catch (e) { toast('❌ فشل تحميل العرض التقديمي'); }
+    frame.src = previewUrl;
+  }
+}
+
+function initSlideViewer_(slideImages) {
+  slideViewerState.mode = 'images';
+  slideViewerState.images = slideImages.slice().sort((a, b) => (a.order || 0) - (b.order || 0));
+  slideViewerState.current = 0;
+
+  const frame = document.getElementById('presentation-frame');
+  const img = document.getElementById('slide-image');
+  const controls = document.getElementById('slide-controls');
+  if (frame) { frame.style.display = 'none'; frame.src = ''; }
+  if (img) img.style.display = 'block';
+  if (controls) controls.style.display = 'flex';
+
+  renderCurrentSlide_();
+  setupSlideKeyboardNav_();
+}
+
+function renderCurrentSlide_() {
+  const img = document.getElementById('slide-image');
+  const counter = document.getElementById('slide-counter');
+  const prevBtn = document.getElementById('slide-prev-btn');
+  const nextBtn = document.getElementById('slide-next-btn');
+  const { images, current } = slideViewerState;
+  if (img) img.src = images[current].imageUrl;
+  if (counter) counter.textContent = `شريحة ${current + 1} من ${images.length}`;
+  if (prevBtn) prevBtn.disabled = current === 0;
+  if (nextBtn) nextBtn.disabled = current === images.length - 1;
+  // Warm the browser cache for the next/previous slide so paging feels
+  // instant instead of showing a blank frame while it fetches.
+  [current - 1, current + 1].forEach((i) => {
+    if (i >= 0 && i < images.length) { const pre = new Image(); pre.src = images[i].imageUrl; }
+  });
+}
+
+function nextSlide() {
+  if (slideViewerState.mode !== 'images') return;
+  if (slideViewerState.current < slideViewerState.images.length - 1) {
+    slideViewerState.current += 1;
+    renderCurrentSlide_();
+  }
+}
+function prevSlide() {
+  if (slideViewerState.mode !== 'images') return;
+  if (slideViewerState.current > 0) {
+    slideViewerState.current -= 1;
+    renderCurrentSlide_();
+  }
+}
+
+// Attached once via this flag since loadPresentationPage only runs once
+// per page load — guards against a future double-init adding the
+// listener twice.
+let slideKeyboardNavAttached_ = false;
+function setupSlideKeyboardNav_() {
+  if (slideKeyboardNavAttached_) return;
+  slideKeyboardNavAttached_ = true;
+  document.addEventListener('keydown', (e) => {
+    if (slideViewerState.mode !== 'images') return;
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    // Right arrow = next, left = previous — matches PowerPoint's own
+    // default keys regardless of the page's RTL layout, so it behaves
+    // the way a student already expects from PowerPoint/Slides itself.
+    if (e.key === 'ArrowRight') { e.preventDefault(); nextSlide(); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); prevSlide(); }
+    else if (e.key === 'Escape' && document.fullscreenElement) { document.exitFullscreen(); }
+  });
+}
+
+function toggleSlideFullscreen() {
+  const wrap = document.getElementById('presentation-viewer');
+  if (!wrap) return;
+  if (!document.fullscreenElement) {
+    wrap.requestFullscreen?.().catch(() => toast('❌ تعذر فتح وضع ملء الشاشة'));
+  } else {
+    document.exitFullscreen();
+  }
 }
 
 // Tiles the student's name + code across the presentation area so any
