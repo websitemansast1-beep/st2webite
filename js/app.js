@@ -258,38 +258,67 @@ async function handleLogin(e) {
 // Load my courses
 async function loadMyCourses() {
   const grid = document.getElementById('my-courses');
+  if (!grid) return;
+
+  const fetchMyCourses = () => api('/students/my-courses');
+
+  // Instant path: if prefetchLikelyNextPages_() (or an earlier visit)
+  // already warmed the cache, render from it immediately — no waiting on
+  // Sheets at all — then still quietly re-fetch in the background so the
+  // cache doesn't go stale for the NEXT time this page is opened.
+  const cached = mfxCacheGet_('my-courses');
+  if (cached) {
+    renderMyCourses_(cached);
+    fetchMyCourses().then((fresh) => {
+      if (fresh) { mfxCacheSet_('my-courses', fresh); renderMyCourses_(fresh); }
+    }).catch(() => {});
+    startPeriodicRefresh_('my-courses', fetchMyCourses, renderMyCourses_);
+    return;
+  }
+
+  try {
+    const data = await fetchMyCourses();
+    mfxCacheSet_('my-courses', data);
+    renderMyCourses_(data);
+    startPeriodicRefresh_('my-courses', fetchMyCourses, renderMyCourses_);
+  } catch (e) {
+    grid.innerHTML = '';
+    const empty = document.getElementById('courses-empty');
+    if (empty) empty.style.display = 'block';
+  }
+}
+
+function renderMyCourses_(data) {
+  const grid = document.getElementById('my-courses');
   const empty = document.getElementById('courses-empty');
   if (!grid) return;
-  try {
-    const data = await api('/students/my-courses');
-    grid.innerHTML = '';
-    if (!data.courses || !data.courses.length) {
-      if (empty) empty.style.display = 'block';
-      return;
-    }
-    if (empty) empty.style.display = 'none';
-    data.courses.forEach(c => {
-      const div = document.createElement('div');
-      div.className = 'card';
-      div.innerHTML = `
-        <div class="card-img">${c.icon || '📚'}</div>
-        <div class="card-body">
-          <span class="card-tag">${c.tag || 'كورس'}</span>
-          <h3>${escapeHtml(c.title)}</h3>
-          <p>${escapeHtml(c.description || '')}</p>
-          <div style="margin:12px 0;">
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px; font-size:0.85rem;">
-              <span style="color:var(--text-secondary);">التقدم</span>
-              <span style="color:var(--accent-light); font-weight:600;">${c.progress || 0}%</span>
-            </div>
-            <div class="prog"><div class="prog-fill" style="width:${c.progress || 0}%"></div></div>
+  grid.innerHTML = '';
+  if (!data.courses || !data.courses.length) {
+    if (empty) empty.style.display = 'block';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  data.courses.forEach(c => {
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.innerHTML = `
+      <div class="card-img">${c.icon || '📚'}</div>
+      <div class="card-body">
+        <span class="card-tag">${c.tag || 'كورس'}</span>
+        <h3>${escapeHtml(c.title)}</h3>
+        <p>${escapeHtml(c.description || '')}</p>
+        <div style="margin:12px 0;">
+          <div style="display:flex; justify-content:space-between; margin-bottom:6px; font-size:0.85rem;">
+            <span style="color:var(--text-secondary);">التقدم</span>
+            <span style="color:var(--accent-light); font-weight:600;">${c.progress || 0}%</span>
           </div>
-          <a href="course.html?id=${c.id}" class="btn btn-primary" style="width:100%;">متابعة الكورس</a>
+          <div class="prog"><div class="prog-fill" style="width:${c.progress || 0}%"></div></div>
         </div>
-      `;
-      grid.appendChild(div);
-    });
-  } catch (e) { grid.innerHTML = ''; if (empty) empty.style.display = 'block'; }
+        <a href="course.html?id=${c.id}" class="btn btn-primary" style="width:100%;">متابعة الكورس</a>
+      </div>
+    `;
+    grid.appendChild(div);
+  });
 }
 
 // Load course detail
@@ -297,28 +326,45 @@ async function loadCourse() {
   const params = new URLSearchParams(location.search);
   const id = params.get('id');
   if (!id) { toast('❌ كورس غير موجود'); return; }
+  const cacheKey = 'course-' + id;
+
+  // loadCourseExams renders the exams list itself as a side effect (it's
+  // not just a data fetch) and has its own loading state, so it always
+  // runs live — only the units/title/description data below goes
+  // through the cache.
+  loadCourseExams(id);
+
+  const fetchCourse = () => api('/units?courseId=' + id);
+
+  const cached = mfxCacheGet_(cacheKey);
+  if (cached) {
+    renderCourse_(cached);
+    startPeriodicRefresh_(cacheKey, fetchCourse, renderCourse_);
+    return;
+  }
+
   try {
-    // These two are independent — fire them together, and reuse the
-    // course-detail response for the units accordion instead of the old
-    // code's second (redundant) call to the same endpoint.
-    const [c] = await Promise.all([
-      api('/units?courseId=' + id),
-      loadCourseExams(id)
-    ]);
-    document.getElementById('course-title').textContent = c.title || 'كورس';
-    document.getElementById('course-desc').textContent = c.description || '';
-    document.getElementById('course-meta').innerHTML = `
-      <span>📚 ${c.units || 0} وحدة</span>
-      <span>🎥 ${c.videos || 0} فيديو</span>
-      <span>📝 ${c.exams || 0} امتحان</span>
-    `;
-    document.getElementById('course-badges').innerHTML = `
-      ${c.popular ? '<span class="badge badge-warn">🔥 شائع</span>' : ''}
-      <span class="badge badge-ok">✓ مسجل</span>
-    `;
-    renderUnits(c.units || []);
-    renderVocabList_(c.vocabulary || []);
+    const c = await fetchCourse();
+    mfxCacheSet_(cacheKey, c);
+    renderCourse_(c);
+    startPeriodicRefresh_(cacheKey, fetchCourse, renderCourse_);
   } catch (e) { toast('❌ فشل تحميل الكورس'); }
+}
+
+function renderCourse_(c) {
+  document.getElementById('course-title').textContent = c.title || 'كورس';
+  document.getElementById('course-desc').textContent = c.description || '';
+  document.getElementById('course-meta').innerHTML = `
+    <span>📚 ${c.units || 0} وحدة</span>
+    <span>🎥 ${c.videos || 0} فيديو</span>
+    <span>📝 ${c.exams || 0} امتحان</span>
+  `;
+  document.getElementById('course-badges').innerHTML = `
+    ${c.popular ? '<span class="badge badge-warn">🔥 شائع</span>' : ''}
+    <span class="badge badge-ok">✓ مسجل</span>
+  `;
+  renderUnits(c.units || []);
+  renderVocabList_(c.vocabulary || []);
 }
 
 // Course vocabulary — AI-read words/phrases (Web Speech API, no audio
@@ -841,30 +887,64 @@ async function confirmSubmit() {
   clearInterval(timerInt);
   clearInterval(autosaveInt);
   if ('speechSynthesis' in window) window.speechSynthesis.cancel();
-  const confirmBtn = document.querySelector('#submit-modal .btn-primary');
-  toast('⏳ جاري تسليم الامتحان...');
-  await withButtonLock(confirmBtn, 'جاري التسليم...', async () => {
-    try {
-      const data = await api('/attempts/' + examState.attemptId + '/submit', {
-        method: 'POST',
-        body: JSON.stringify({ answers: examState.answers })
-      });
-      if (!data || !data.ok) {
-        toast('❌ ' + ((data && data.error) || 'فشل تسليم الامتحان'));
-        return;
-      }
-      clearAnswersLocally_();
-      showSubmissionReceived_();
 
-      if (data.data && data.data.status === 'COMPLETED') {
-        // Already flushed (e.g. queue was empty and flushed instantly) —
-        // no need to poll at all.
-        showResult(data.data);
-        return;
-      }
-      pollSubmissionStatus_(examState.attemptId);
-    } catch (e) {}
-  });
+  // Truly optimistic submit: the student sees "✓ تم استلام إجاباتك"
+  // INSTANTLY — no waiting on the network at all. This is safe because
+  // every answer is already autosaved to the server every 10s AND kept
+  // in localStorage on every change (see saveAnswersLocally_), so the
+  // final POST /submit call below is really just "finalize + start
+  // grading", not the only copy of the student's answers. It's sent
+  // right after, in the background, with automatic retries — the
+  // student is only ever bothered with an error if it still hasn't
+  // gone through after those retries.
+  showSubmissionReceived_();
+  submitExamInBackground_(examState.attemptId, examState.answers);
+}
+
+// keepalive:true asks the browser to let this specific request finish
+// even if the page is being unloaded right as it fires (e.g. the
+// student closes the tab the instant they see "تم") — the same
+// protection a normal awaited request wouldn't have gotten anyway, so
+// this is a pure improvement, not a new risk. (Fetch's keepalive has a
+// combined ~64KB request-body cap across in-flight keepalive requests;
+// a typical exam answer payload is well under that, so this is a safe
+// default rather than something that needs its own fallback path.)
+async function submitExamInBackground_(attemptId, answers, attemptNum = 1) {
+  const MAX_ATTEMPTS = 3;
+  try {
+    const data = await api('/attempts/' + attemptId + '/submit', {
+      method: 'POST',
+      keepalive: true,
+      body: JSON.stringify({ answers })
+    });
+    if (!data || !data.ok) throw new Error((data && data.error) || 'فشل تسليم الامتحان');
+
+    clearAnswersLocally_();
+    if (data.data && data.data.status === 'COMPLETED') {
+      // Already flushed (e.g. queue was empty and flushed instantly) —
+      // no need to poll at all.
+      showResult(data.data);
+      return;
+    }
+    pollSubmissionStatus_(attemptId);
+  } catch (e) {
+    if (attemptNum < MAX_ATTEMPTS) {
+      // Silent retry — the student already sees "تم", so a flaky
+      // connection resolving itself a couple seconds later should never
+      // need to interrupt them with anything.
+      setTimeout(() => submitExamInBackground_(attemptId, answers, attemptNum + 1), 1500 * attemptNum);
+    } else {
+      // Only now, after automatic retries are exhausted, does the
+      // student need to know — same recovery UI ("إعادة المحاولة") used
+      // elsewhere in this flow, so it's a familiar state, not a new one.
+      setResultModalState_({
+        icon: '⚠️',
+        title: 'حدث خطأ أثناء حفظ الامتحان',
+        score: '', rank: 'إجاباتك محفوظة محليًا ولم تُفقد — جرّب "إعادة المحاولة"', time: '',
+        showRetry: true
+      });
+    }
+  }
 }
 
 // Step 1 of the two-step message from the spec: confirm receipt instantly,
@@ -903,13 +983,7 @@ function setResultModalState_({ icon, title, score, rank, time, showRetry }) {
 // queueing (still idempotent — the attempt id is unchanged).
 async function retrySubmit_() {
   showSubmissionReceived_();
-  pollSubmissionStatus_(examState.attemptId);
-  try {
-    await api('/attempts/' + examState.attemptId + '/submit', {
-      method: 'POST',
-      body: JSON.stringify({ answers: examState.answers })
-    });
-  } catch (e) {}
+  submitExamInBackground_(examState.attemptId, examState.answers);
 }
 
 // Graduated polling: 2s, 4s, 8s, then holds at 8s. Stops immediately on
@@ -987,8 +1061,32 @@ async function loadDashboard() {
   const user = getUser();
   document.getElementById('student-name').textContent = user.name || '—';
   document.getElementById('nav-name').textContent = user.name || '—';
+
+  const fetchDashboard = () => api('/students/dashboard');
+
+  // Same instant-from-cache, refresh-in-background pattern as
+  // loadMyCourses — see prefetchLikelyNextPages_() for where the cache
+  // gets warmed up ahead of time.
+  const cached = mfxCacheGet_('dashboard');
+  if (cached) {
+    renderDashboard_(cached);
+    fetchDashboard().then((fresh) => {
+      if (fresh) { mfxCacheSet_('dashboard', fresh); renderDashboard_(fresh); }
+    }).catch(() => {});
+    startPeriodicRefresh_('dashboard', fetchDashboard, renderDashboard_);
+    return;
+  }
+
   try {
-    const data = await api('/students/dashboard');
+    const data = await fetchDashboard();
+    mfxCacheSet_('dashboard', data);
+    renderDashboard_(data);
+    startPeriodicRefresh_('dashboard', fetchDashboard, renderDashboard_);
+  } catch (e) {}
+}
+
+function renderDashboard_(data) {
+  try {
     if (data.courses != null) document.getElementById('dash-courses').textContent = data.courses;
     if (data.exams != null) document.getElementById('dash-exams').textContent = data.exams;
     if (data.avgScore != null) document.getElementById('dash-score').textContent = data.avgScore + '%';
@@ -1484,6 +1582,73 @@ function toggleAcc(header) {
 }
 
 // Init
+// ===== Cross-page cache (sessionStorage) =====
+// This is a traditional multi-page site — every navigation (index.html ->
+// course.html -> ...) is a full page reload, so a plain in-memory JS
+// variable wouldn't survive it. sessionStorage does (same tab, cleared
+// when the tab closes). Used so "كورساتي" / "لوحتي" can render INSTANTLY
+// from a cache that was quietly warmed up in the background a moment
+// earlier — either by an earlier visit to that same page, or by
+// prefetchLikelyNextPages_() below — instead of waiting on a fresh
+// Google Sheets round-trip every single time.
+const MFX_CACHE_TTL_MS = 60 * 1000;
+function mfxCacheGet_(key) {
+  try {
+    const raw = sessionStorage.getItem('mfx_cache_' + key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (Date.now() - parsed.at > MFX_CACHE_TTL_MS) return null;
+    return parsed.data;
+  } catch (e) {
+    return null;
+  }
+}
+function mfxCacheSet_(key, data) {
+  try {
+    sessionStorage.setItem('mfx_cache_' + key, JSON.stringify({ data, at: Date.now() }));
+  } catch (e) {}
+}
+
+// Keeps a page's data "live" for as long as the student stays on it —
+// re-fetches every 3 minutes in the background, updates the cache, and
+// re-renders in place, so someone sitting on their dashboard or a course
+// page for a while sees it stay current on its own, the same way the
+// instant cached-render + one-off background revalidate already does for
+// the moment the page first opens. Silent on failure (a missed refresh
+// just tries again next cycle); torn down automatically when the page is
+// left, since navigating anywhere in this multi-page site is a full
+// reload that clears every JS timer with it — nothing to clean up by hand.
+const MFX_PERIODIC_REFRESH_MS = 3 * 60 * 1000;
+function startPeriodicRefresh_(key, fetchFn, renderFn) {
+  setInterval(async () => {
+    try {
+      const fresh = await fetchFn();
+      if (fresh) { mfxCacheSet_(key, fresh); renderFn(fresh); }
+    } catch (e) {}
+  }, MFX_PERIODIC_REFRESH_MS);
+}
+
+// Quietly re-fetches the pages a student is most likely to open NEXT
+// (their course list, their dashboard) in the background and caches the
+// result, so navigating there shortly after feels instant instead of
+// waiting on Sheets again. Deliberately starts a beat AFTER the current
+// page's own content is already on screen — never competes with it for
+// bandwidth/the Apps Script concurrency slots — and never shows anything
+// to the student on failure; a missed prefetch just means the next page
+// loads normally, exactly like it does today.
+function prefetchLikelyNextPages_() {
+  setTimeout(async () => {
+    try {
+      const courses = await api('/students/my-courses');
+      if (courses) mfxCacheSet_('my-courses', courses);
+    } catch (e) {}
+    try {
+      const dash = await api('/students/dashboard');
+      if (dash) mfxCacheSet_('dashboard', dash);
+    } catch (e) {}
+  }, 1200);
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
   const path = location.pathname;
   if (path.includes('login.html')) {
@@ -1511,6 +1676,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (path.includes('video.html')) withPageLoader(loadVideoPage);
   if (path.includes('presentation.html')) withPageLoader(loadPresentationPage);
   if (path.includes('chat.html')) withPageLoader(loadChatPage);
+
+  // Quietly warm the cache for the pages a student is most likely to
+  // open next, on every authenticated page — not just login — so
+  // navigating around the site keeps feeling fast the whole session,
+  // not just right after logging in.
+  prefetchLikelyNextPages_();
 });
 
 // When the browser restores a page from its back/forward cache (e.g. the
