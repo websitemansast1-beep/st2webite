@@ -245,7 +245,7 @@ async function requireAuth() {
   return true;
 }
 
-// Login
+// Login مع timeout وretry logic
 async function handleLogin(e) {
   e.preventDefault();
   const form = document.getElementById('login-form');
@@ -258,57 +258,116 @@ async function handleLogin(e) {
 
   await withButtonLock(btn, 'جاري تسجيل الدخول...', async () => {
     if (form) form.querySelectorAll('input').forEach((i) => i.disabled = true);
-    try {
-      const data = await api('/auth/student-login', {
-        method: 'POST',
-        body: JSON.stringify({ code, name, phone, guardianPhone })
-      });
-      if (data && data.token) {
-        setToken(data.token);
-        if (data.refreshToken) setRefreshToken(data.refreshToken);
-        localStorage.setItem('mfx_student_user', JSON.stringify(data.user));
-        toast('✅ تم تسجيل الدخول');
-        location.href = 'index.html'; // single navigation — no repeated reloads
-      } else {
-        toast('❌ ' + ((data && data.error) || 'كود أو اسم غير صحيح'));
-        if (form) form.querySelectorAll('input').forEach((i) => i.disabled = false);
+    
+    const loginWithTimeout = async (attempt = 1) => {
+      const maxAttempts = 3;
+      const timeout = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Timeout')), 8000) // 8 ثواني timeout
+      );
+      
+      try {
+        const loginPromise = api('/auth/student-login', {
+          method: 'POST',
+          body: JSON.stringify({ code, name, phone, guardianPhone })
+        });
+        
+        const data = await Promise.race([loginPromise, timeout]);
+        
+        if (data && data.token) {
+          setToken(data.token);
+          if (data.refreshToken) setRefreshToken(data.refreshToken);
+          localStorage.setItem('mfx_student_user', JSON.stringify(data.user));
+          toast('✅ تم تسجيل الدخول');
+          location.href = 'index.html';
+          return true;
+        } else {
+          toast('❌ ' + ((data && data.error) || 'كود أو اسم غير صحيح'));
+          if (form) form.querySelectorAll('input').forEach((i) => i.disabled = false);
+          return false;
+        }
+      } catch (err) {
+        if (attempt < maxAttempts) {
+          console.log(`Login attempt ${attempt} failed, retrying... (${maxAttempts - attempt} retries left)`);
+          await new Promise(r => setTimeout(r, 1000)); // انتظر ثانية قبل المحاولة التالية
+          return loginWithTimeout(attempt + 1);
+        } else {
+          toast('❌ فشل تسجيل الدخول. تحقق من البيانات والاتصال ثم حاول مجدداً');
+          if (form) form.querySelectorAll('input').forEach((i) => i.disabled = false);
+          return false;
+        }
       }
-    } catch (err) {
-      if (form) form.querySelectorAll('input').forEach((i) => i.disabled = false);
-    }
+    };
+    
+    await loginWithTimeout();
   });
 }
 
-// Load my courses
+// Load my courses مع retry logic ومعالجة أفضل للأخطاء
 async function loadMyCourses() {
   const grid = document.getElementById('my-courses');
   if (!grid) return;
 
-  const fetchMyCourses = () => api('/students/my-courses');
+  const fetchMyCourses = async (attempt = 1) => {
+    const maxAttempts = 3;
+    try {
+      const data = await api('/students/my-courses');
+      if (!data || !data.courses) {
+        if (attempt < maxAttempts) {
+          await new Promise(r => setTimeout(r, 500));
+          return fetchMyCourses(attempt + 1);
+        }
+        return null;
+      }
+      return data;
+    } catch (e) {
+      if (attempt < maxAttempts) {
+        console.warn(`Fetch courses attempt ${attempt} failed, retrying...`);
+        await new Promise(r => setTimeout(r, 500));
+        return fetchMyCourses(attempt + 1);
+      }
+      throw e;
+    }
+  };
 
-  // Instant path: if prefetchLikelyNextPages_() (or an earlier visit)
-  // already warmed the cache, render from it immediately — no waiting on
-  // Sheets at all — then still quietly re-fetch in the background so the
-  // cache doesn't go stale for the NEXT time this page is opened.
+  // Instant path: إذا كانت البيانات موجودة في الكاش
   const cached = mfxCacheGet_('my-courses');
   if (cached) {
     renderMyCourses_(cached);
     fetchMyCourses().then((fresh) => {
       if (fresh) { mfxCacheSet_('my-courses', fresh); renderMyCourses_(fresh); }
-    }).catch(() => {});
+    }).catch((e) => { console.warn('Background fetch failed:', e); });
     startPeriodicRefresh_('my-courses', fetchMyCourses, renderMyCourses_);
     return;
   }
 
   try {
     const data = await fetchMyCourses();
-    mfxCacheSet_('my-courses', data);
-    renderMyCourses_(data);
+    if (data) {
+      mfxCacheSet_('my-courses', data);
+      renderMyCourses_(data);
+    } else {
+      showDataError_(grid, 'courses-empty', 'فشل تحميل الكورسات. يرجى تحديث الصفحة.');
+    }
     startPeriodicRefresh_('my-courses', fetchMyCourses, renderMyCourses_);
   } catch (e) {
-    grid.innerHTML = '';
-    const empty = document.getElementById('courses-empty');
-    if (empty) empty.style.display = 'block';
+    showDataError_(grid, 'courses-empty', 'فشل تحميل الكورسات. يرجى تحديث الصفحة.');
+  }
+}
+
+// دالة مساعدة لعرض رسالة خطأ مع زر إعادة تحميل
+function showDataError_(container, emptyElementId, message) {
+  container.innerHTML = '';
+  const empty = document.getElementById(emptyElementId);
+  if (empty) {
+    empty.style.display = 'block';
+    // أضف رسالة خطأ إن لم تكن موجودة
+    if (!empty.querySelector('.error-message')) {
+      const errorDiv = document.createElement('div');
+      errorDiv.className = 'error-message';
+      errorDiv.style.cssText = 'text-align:center;padding:20px;color:#e74c3c;font-size:14px;';
+      errorDiv.innerHTML = `<p>${message}</p><button onclick="location.reload()" style="margin-top:10px;padding:8px 16px;background:#e74c3c;color:white;border:none;border-radius:4px;cursor:pointer;">إعادة تحميل</button>`;
+      empty.appendChild(errorDiv);
+    }
   }
 }
 
@@ -317,8 +376,13 @@ function renderMyCourses_(data) {
   const empty = document.getElementById('courses-empty');
   if (!grid) return;
   grid.innerHTML = '';
-  if (!data.courses || !data.courses.length) {
-    if (empty) empty.style.display = 'block';
+  if (!data || !data.courses || !data.courses.length) {
+    if (empty) {
+      empty.style.display = 'block';
+      // امسح أي رسالة خطأ سابقة
+      const errorMsg = empty.querySelector('.error-message');
+      if (errorMsg) errorMsg.remove();
+    }
     return;
   }
   if (empty) empty.style.display = 'none';
@@ -519,10 +583,33 @@ async function loadCourseExams(courseId) {
   const list = document.getElementById('exams-list');
   const empty = document.getElementById('exams-empty');
   if (!list) return;
+  
+  const fetchExams = async (attempt = 1) => {
+    const maxAttempts = 3;
+    try {
+      const data = await api('/exams?courseId=' + courseId);
+      if (!data) {
+        if (attempt < maxAttempts) {
+          await new Promise(r => setTimeout(r, 500));
+          return fetchExams(attempt + 1);
+        }
+        return null;
+      }
+      return data;
+    } catch (e) {
+      if (attempt < maxAttempts) {
+        console.warn(`Fetch exams attempt ${attempt} failed, retrying...`);
+        await new Promise(r => setTimeout(r, 500));
+        return fetchExams(attempt + 1);
+      }
+      throw e;
+    }
+  };
+  
   try {
-    const data = await api('/exams?courseId=' + courseId);
+    const data = await fetchExams();
     list.innerHTML = '';
-    const exams = data.exams || [];
+    const exams = data && data.exams ? data.exams : [];
     if (!exams.length) { if (empty) empty.style.display = 'block'; return; }
     if (empty) empty.style.display = 'none';
     exams.forEach(ex => {
@@ -543,7 +630,10 @@ async function loadCourseExams(courseId) {
       `;
       list.appendChild(div);
     });
-  } catch (e) { list.innerHTML = ''; if (empty) empty.style.display = 'block'; }
+  } catch (e) {
+    console.warn('Load exams failed:', e);
+    showDataError_(list, 'exams-empty', 'فشل تحميل الامتحانات. يرجى تحديث الصفحة.');
+  }
 }
 
 // Exam
@@ -1086,7 +1176,27 @@ async function loadDashboard() {
   document.getElementById('student-name').textContent = user.name || '—';
   document.getElementById('nav-name').textContent = user.name || '—';
 
-  const fetchDashboard = () => api('/students/dashboard');
+  const fetchDashboard = async (attempt = 1) => {
+    const maxAttempts = 3;
+    try {
+      const data = await api('/students/dashboard');
+      if (!data) {
+        if (attempt < maxAttempts) {
+          await new Promise(r => setTimeout(r, 500));
+          return fetchDashboard(attempt + 1);
+        }
+        return null;
+      }
+      return data;
+    } catch (e) {
+      if (attempt < maxAttempts) {
+        console.warn(`Fetch dashboard attempt ${attempt} failed, retrying...`);
+        await new Promise(r => setTimeout(r, 500));
+        return fetchDashboard(attempt + 1);
+      }
+      throw e;
+    }
+  };
 
   // Same instant-from-cache, refresh-in-background pattern as
   // loadMyCourses — see prefetchLikelyNextPages_() for where the cache
@@ -1096,17 +1206,21 @@ async function loadDashboard() {
     renderDashboard_(cached);
     fetchDashboard().then((fresh) => {
       if (fresh) { mfxCacheSet_('dashboard', fresh); renderDashboard_(fresh); }
-    }).catch(() => {});
+    }).catch((e) => { console.warn('Background fetch dashboard failed:', e); });
     startPeriodicRefresh_('dashboard', fetchDashboard, renderDashboard_);
     return;
   }
 
   try {
     const data = await fetchDashboard();
-    mfxCacheSet_('dashboard', data);
-    renderDashboard_(data);
+    if (data) {
+      mfxCacheSet_('dashboard', data);
+      renderDashboard_(data);
+    }
     startPeriodicRefresh_('dashboard', fetchDashboard, renderDashboard_);
-  } catch (e) {}
+  } catch (e) {
+    console.warn('Dashboard load failed:', e);
+  }
 }
 
 function renderDashboard_(data) {
@@ -1615,22 +1729,35 @@ function toggleAcc(header) {
 // earlier — either by an earlier visit to that same page, or by
 // prefetchLikelyNextPages_() below — instead of waiting on a fresh
 // Google Sheets round-trip every single time.
-const MFX_CACHE_TTL_MS = 60 * 1000;
+const MFX_CACHE_TTL_MS = 30 * 60 * 1000; // 30 دقيقة بدل دقيقة واحدة
 function mfxCacheGet_(key) {
   try {
     const raw = sessionStorage.getItem('mfx_cache_' + key);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (Date.now() - parsed.at > MFX_CACHE_TTL_MS) return null;
-    return parsed.data;
+    // التحقق من أن البيانات ليست فارغة
+    const data = parsed.data;
+    if (!data || (data && typeof data === 'object' && Object.keys(data).length === 0)) return null;
+    return data;
   } catch (e) {
+    console.warn('Cache read error:', e);
     return null;
   }
 }
 function mfxCacheSet_(key, data) {
+  if (!data || (data && typeof data === 'object' && Object.keys(data).length === 0)) {
+    // عدم حفظ بيانات فارغة
+    return false;
+  }
   try {
     sessionStorage.setItem('mfx_cache_' + key, JSON.stringify({ data, at: Date.now() }));
-  } catch (e) {}
+    return true;
+  } catch (e) {
+    console.warn('Cache write error:', e);
+    // إذا sessionStorage معطّل (incognito mode مثلاً)، استمر بدونه
+    return false;
+  }
 }
 
 // Keeps a page's data "live" for as long as the student stays on it —
