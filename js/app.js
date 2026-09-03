@@ -13,40 +13,57 @@ function toast(msg) {
 }
 
 // ===== Global click rate-limiter =====
-// Blocks a SECOND click on the same button/link within a short cooldown
-// window, site-wide, for every page. This is separate from — and a
-// backstop for — withButtonLock below: that only protects the specific
-// actions someone remembered to wrap. This catches everything else
-// (plain onclick="..." handlers: pagination, tabs, small actions) without
-// having to touch every single one of them individually. It does NOT
-// affect the exam's answer-option clicks (pickOpt/toggleMultiOpt) — those
-// go through their own delegated listener on <label class="opt">
+// Blocks a SECOND click on the same button/link WHILE its first click's
+// own action is still actually running — site-wide, for every page.
+// This is separate from — and a backstop for — withButtonLock below:
+// that only protects the specific actions someone remembered to wrap
+// (with a visible spinner too). This catches everything else (plain
+// onclick="..." handlers: publish/hide/delete buttons, pagination, tabs)
+// without having to touch every single one of them individually. It does
+// NOT affect the exam's answer-option clicks (pickOpt/toggleMultiOpt) —
+// those go through their own delegated listener on <label class="opt">
 // elements, which this selector doesn't match, so answering stays instant.
 //
 // How it works: a single listener on document, in the CAPTURE phase (so
-// it runs before the target element's own onclick), tracks the last time
-// each element was clicked in a WeakMap. A second click on the SAME
-// element inside the cooldown window is stopped before it ever reaches
-// that element's own handler — e.stopPropagation() during capture means
-// the event never continues down to the target at all. Clicking a
-// DIFFERENT button right after is unaffected, since the cooldown is
+// it runs before the target element's own onclick), marks the clicked
+// element "busy" and lets the click through as normal. A SECOND click on
+// that SAME element while it's still busy is stopped before it ever
+// reaches the element's own handler. What clears "busy" is not a guessed
+// fixed delay — it's mfxActiveApiCalls (see api() above): if the click
+// triggered a network request, the button stays locked for exactly as
+// long as that request takes, then unlocks the instant it settles — a
+// slow save stays protected the whole time it's slow, a fast one
+// unlocks right away. If the click never touched the network at all (a
+// pure UI toggle like a tab or accordion), it unlocks almost
+// immediately instead of also being held for the network case's longer
+// window. A 15s safety cap prevents a button from ever being stuck
+// locked forever if something genuinely never resolves. Clicking a
+// DIFFERENT button right after is unaffected either way, since "busy" is
 // tracked per-element, not globally.
-(function setupMfxClickRateLimiter() {
-  const COOLDOWN_MS = 700;
-  const lastClickAt = new WeakMap();
-  document.addEventListener('click', function (e) {
-    const el = e.target.closest('button, .btn, [onclick]');
-    if (!el) return;
-    const now = Date.now();
-    const last = lastClickAt.get(el) || 0;
-    if (now - last < COOLDOWN_MS) {
-      e.stopPropagation();
-      e.preventDefault();
-      return;
+document.addEventListener('click', function (e) {
+  const el = e.target.closest('button, .btn, [onclick]');
+  if (!el) return;
+  if (el.dataset.mfxBusy === '1') {
+    e.stopPropagation();
+    e.preventDefault();
+    return;
+  }
+  el.dataset.mfxBusy = '1';
+  const before = mfxActiveApiCalls;
+  setTimeout(() => {
+    if (mfxActiveApiCalls > before) {
+      const check = setInterval(() => {
+        if (mfxActiveApiCalls <= before) {
+          clearInterval(check);
+          delete el.dataset.mfxBusy;
+        }
+      }, 100);
+      setTimeout(() => { clearInterval(check); delete el.dataset.mfxBusy; }, 15000);
+    } else {
+      delete el.dataset.mfxBusy;
     }
-    lastClickAt.set(el, now);
-  }, true);
-})();
+  }, 50);
+}, true);
 
 // ===== Global loading / anti-duplicate-click helpers =====
 // Every important action (login, start exam, save, submit) routes through
@@ -171,6 +188,11 @@ async function refreshAccessToken() {
   }
 }
 
+// Tracks how many api() calls are currently in flight — used by the
+// click rate-limiter below to know exactly when a button's own action
+// has actually finished, instead of guessing with a fixed timer.
+let mfxActiveApiCalls = 0;
+
 async function api(path, opts = {}) {
   const url = API + path;
   const doFetch = async () => {
@@ -179,6 +201,7 @@ async function api(path, opts = {}) {
     if (token) headers['Authorization'] = 'Bearer ' + token;
     return fetch(url, { ...opts, headers: { ...headers, ...opts.headers } });
   };
+  mfxActiveApiCalls++;
   try {
     let res = await doFetch();
     // A 401 mid-session (the token expired while the student was
@@ -193,6 +216,7 @@ async function api(path, opts = {}) {
     }
     return await res.json();
   } catch (e) { toast('❌ خطأ في الاتصال'); throw e; }
+  finally { mfxActiveApiCalls--; }
 }
 
 // Auth check — runs on every page load. Instead of logging the student
